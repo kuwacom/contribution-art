@@ -595,7 +595,9 @@ def loadCommitHistory(branchName: str) -> tuple[CommitInfo, ...]:
         if not rawRecord.strip():
             continue
 
-        recordParts = rawRecord.split("\x1f", maxsplit=9)
+        # git log のレコード区切り直後に改行が入るため先頭だけ明示的に落とす
+        normalizedRecord = rawRecord.lstrip("\r\n")
+        recordParts = normalizedRecord.split("\x1f", maxsplit=9)
         if len(recordParts) != 10:
             raise ContributionArtError("コミット履歴の解析に失敗しました")
 
