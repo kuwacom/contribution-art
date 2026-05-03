@@ -116,7 +116,7 @@ class CliConfig:
     seed: int
     apply: bool
     push: bool
-    resetBranchHistory: bool
+    resetDrawingRange: bool
     remote: str
     branch: str
     showDates: bool
@@ -147,6 +147,23 @@ class GraphPlan:
     totalCommits: int
 
 
+@dataclass(frozen=True)
+class CommitInfo:
+    """履歴再構成で使うコミット情報を表す"""
+
+    commitHash: str
+    treeHash: str
+    parentHashes: tuple[str, ...]
+    authorName: str
+    authorEmail: str
+    authorDate: datetime
+    committerName: str
+    committerEmail: str
+    committerDate: datetime
+    message: str
+    subject: str
+
+
 def main() -> int:
     """CLI 全体の流れを制御する"""
 
@@ -161,12 +178,13 @@ def main() -> int:
             return 0
 
         ensureCleanWorkingTree()
-        if cliConfig.resetBranchHistory:
-            resetBranchHistory(cliConfig, graphPlan)
+        rewroteHistory = False
+        if cliConfig.resetDrawingRange:
+            rewroteHistory = resetDrawingRangeCommits(cliConfig, graphPlan)
         createCommits(graphPlan, cliConfig)
 
         if cliConfig.push:
-            pushCommits(cliConfig)
+            pushCommits(cliConfig, forceWithLease=rewroteHistory)
 
         print("\n完了しました")
         return 0
@@ -202,10 +220,11 @@ def parseArgs() -> CliConfig:
     parser.add_argument("--apply", action="store_true", help="実際に空コミットを作る")
     parser.add_argument("--push", action="store_true", help="作成後に push する")
     parser.add_argument(
-        "--reset-branch-history",
+        "--reset-drawing-range",
         action="store_true",
-        help="現在ブランチの履歴を作り直してからコミットする",
+        help="指定期間内の古いアート系コミットだけを消してからコミットする",
     )
+    parser.add_argument("--reset-branch-history", dest="reset_drawing_range", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--remote", default=getEnvValue(envValues, "CONTRIBUTION_ART_REMOTE", "origin"))
     parser.add_argument("--branch", default=getEnvValue(envValues, "CONTRIBUTION_ART_BRANCH", detectCurrentBranch()))
     parser.add_argument("--show-dates", action="store_true", help="コミット日ごとの計画も表示する")
@@ -214,8 +233,8 @@ def parseArgs() -> CliConfig:
     if parsedArgs.push and not parsedArgs.apply:
         raise ContributionArtError("--push を使う場合は --apply も必要です")
 
-    if parsedArgs.reset_branch_history and not parsedArgs.apply:
-        raise ContributionArtError("--reset-branch-history を使う場合は --apply も必要です")
+    if parsedArgs.reset_drawing_range and not parsedArgs.apply:
+        raise ContributionArtError("--reset-drawing-range を使う場合は --apply も必要です")
 
     startDate = parseDate(parsedArgs.start_date)
     endDate = parseDate(parsedArgs.end_date)
@@ -254,7 +273,7 @@ def parseArgs() -> CliConfig:
         seed=seed,
         apply=parsedArgs.apply,
         push=parsedArgs.push,
-        resetBranchHistory=parsedArgs.reset_branch_history,
+        resetDrawingRange=parsedArgs.reset_drawing_range,
         remote=parsedArgs.remote,
         branch=parsedArgs.branch,
         showDates=parsedArgs.show_dates,
@@ -324,7 +343,7 @@ def printPlan(graphPlan: GraphPlan, cliConfig: CliConfig) -> None:
     print(f"total commits: {graphPlan.totalCommits}")
     print(f"time window: {cliConfig.timeStart.strftime('%H:%M')} - {cliConfig.timeEnd.strftime('%H:%M')} {cliConfig.timezoneName}")
     print(f"seed: {cliConfig.seed}")
-    print(f"reset branch history: {'yes' if cliConfig.resetBranchHistory else 'no'}")
+    print(f"reset drawing range: {'yes' if cliConfig.resetDrawingRange else 'no'}")
     print("")
 
     renderedRows = renderPreviewRows(graphPlan.gridRows)
@@ -468,47 +487,44 @@ def createCommits(graphPlan: GraphPlan, cliConfig: CliConfig) -> None:
             )
 
 
-def resetBranchHistory(cliConfig: CliConfig, graphPlan: GraphPlan) -> None:
-    """現在ブランチを現在ツリーの 1 コミットへ作り直してから描画を始める"""
+def resetDrawingRangeCommits(cliConfig: CliConfig, graphPlan: GraphPlan) -> bool:
+    """指定期間内の古いアート系コミットだけを履歴から取り除く"""
 
     currentBranchName = requireCurrentBranchName()
-    timestampSuffix = datetime.now().strftime("%Y%m%d%H%M%S")
-    backupBranchName = f"{currentBranchName}-backup-{timestampSuffix}"
-    temporaryBranchName = f"{currentBranchName}-reset-{timestampSuffix}"
-    timezoneInfo = buildTimezoneInfo(cliConfig.timezoneName)
-    baseCommitDate = datetime.combine(
-        graphPlan.requestedStartDate - timedelta(days=1),
-        time(hour=12, minute=0),
-        tzinfo=timezoneInfo,
-    ).isoformat()
+    if currentBranchName != cliConfig.branch:
+        raise ContributionArtError("--reset-drawing-range を使う場合は現在ブランチと --branch を一致させてください")
 
-    runGitCommand(["git", "branch", backupBranchName, currentBranchName])
-    runGitCommand(["git", "switch", "--orphan", temporaryBranchName])
-    runGitCommand(["git", "add", "-A"])
-    runGitCommand(
-        [
-            "git",
-            "commit",
-            "--message",
-            f"chore: reset contribution art base ({backupBranchName})",
-            "--date",
-            baseCommitDate,
-        ],
-        extraEnv={
-            # ベースコミットを対象期間の外へ置いて描画範囲を汚さないようにする
-            "GIT_AUTHOR_DATE": baseCommitDate,
-            "GIT_COMMITTER_DATE": baseCommitDate,
-        },
-    )
-    runGitCommand(["git", "branch", "-M", currentBranchName])
+    commitHistory = loadCommitHistory(currentBranchName)
+    if not commitHistory:
+        raise ContributionArtError("履歴が空のため --reset-drawing-range を実行できません")
+
+    commitByHash = {commitInfo.commitHash: commitInfo for commitInfo in commitHistory}
+    removedCommitHashes = {
+        commitInfo.commitHash
+        for commitInfo in commitHistory
+        if shouldResetCommitForRange(commitInfo, graphPlan, commitByHash)
+    }
+
+    if not removedCommitHashes:
+        print("reset drawing range: 対象コミットはありません")
+        return False
+
+    rewrittenHeadHash = buildRewrittenHistory(commitHistory, removedCommitHashes)
+    currentHeadHash = commitHistory[-1].commitHash
+
+    runGitCommand(["git", "update-ref", "ORIG_HEAD", currentHeadHash])
+    # 作業ツリーをクリーン前提に hard reset しても安全に元ツリーへ同期できる
+    runGitCommand(["git", "reset", "--hard", rewrittenHeadHash])
+    print(f"reset drawing range: {len(removedCommitHashes)} 件のコミットを履歴から除外しました")
+    return True
 
 
-def pushCommits(cliConfig: CliConfig) -> None:
+def pushCommits(cliConfig: CliConfig, *, forceWithLease: bool) -> None:
     """現在の HEAD を指定ブランチへ push する"""
 
     pushCommand = ["git", "push"]
-    if cliConfig.resetBranchHistory:
-        # 履歴を作り直した場合は通常 push では拒否されるため明示的に強制する
+    if forceWithLease:
+        # 履歴を書き換えたときだけ安全側の強制 push を使う
         pushCommand.append("--force-with-lease")
     pushCommand.extend([cliConfig.remote, f"HEAD:{cliConfig.branch}"])
     runGitCommand(pushCommand)
@@ -538,6 +554,7 @@ def runCommand(
     *,
     captureOutput: bool,
     extraEnv: dict[str, str] | None = None,
+    inputText: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """外部コマンドを実行し失敗時は扱いやすい例外へ変換する"""
 
@@ -551,6 +568,7 @@ def runCommand(
         capture_output=captureOutput,
         text=True,
         env=processEnv,
+        input=inputText,
     )
 
     if result.returncode != 0:
@@ -561,6 +579,120 @@ def runCommand(
         raise ContributionArtError(f"コマンドに失敗しました: {joinedCommand}\n{detailText}")
 
     return result
+
+
+def loadCommitHistory(branchName: str) -> tuple[CommitInfo, ...]:
+    """現在ブランチの線形履歴をコミット情報として読み込む"""
+
+    logFormat = "%H%x1f%T%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%B%x1e"
+    result = runCommand(
+        ["git", "log", "--reverse", "--topo-order", f"--format={logFormat}", branchName],
+        captureOutput=True,
+    )
+
+    commitHistory: list[CommitInfo] = []
+    for rawRecord in result.stdout.split("\x1e"):
+        if not rawRecord.strip():
+            continue
+
+        recordParts = rawRecord.split("\x1f", maxsplit=9)
+        if len(recordParts) != 10:
+            raise ContributionArtError("コミット履歴の解析に失敗しました")
+
+        parentHashes = tuple(hashValue for hashValue in recordParts[2].split() if hashValue)
+        if len(parentHashes) > 1:
+            raise ContributionArtError("merge commit がある履歴では --reset-drawing-range を使えません")
+
+        message = recordParts[9]
+        subject = message.splitlines()[0] if message.splitlines() else ""
+        commitHistory.append(
+            CommitInfo(
+                commitHash=recordParts[0],
+                treeHash=recordParts[1],
+                parentHashes=parentHashes,
+                authorName=recordParts[3],
+                authorEmail=recordParts[4],
+                authorDate=datetime.fromisoformat(recordParts[5]),
+                committerName=recordParts[6],
+                committerEmail=recordParts[7],
+                committerDate=datetime.fromisoformat(recordParts[8]),
+                message=message,
+                subject=subject,
+            )
+        )
+
+    return tuple(commitHistory)
+
+
+def shouldResetCommitForRange(
+    commitInfo: CommitInfo,
+    graphPlan: GraphPlan,
+    commitByHash: dict[str, CommitInfo],
+) -> bool:
+    """描画範囲内にある古いアート系コミットだけを除外対象とする"""
+
+    targetDate = commitInfo.authorDate.date()
+    if targetDate < graphPlan.requestedStartDate or targetDate > graphPlan.requestedEndDate:
+        return False
+
+    if not commitInfo.parentHashes:
+        return False
+
+    parentCommit = commitByHash.get(commitInfo.parentHashes[0])
+    if parentCommit is None:
+        return False
+
+    isEmptyCommit = commitInfo.treeHash == parentCommit.treeHash
+    isArtCommit = commitInfo.subject.startswith("art:")
+
+    # 実ファイルを更新した通常コミットまで巻き戻さないよう空コミット系だけを対象にする
+    return isEmptyCommit or isArtCommit
+
+
+def buildRewrittenHistory(commitHistory: tuple[CommitInfo, ...], removedCommitHashes: set[str]) -> str:
+    """除外対象を飛ばしつつ残すコミットだけで新しい線形履歴を組み直す"""
+
+    rewrittenHeadHash: str | None = None
+
+    for commitInfo in commitHistory:
+        if commitInfo.commitHash in removedCommitHashes:
+            continue
+
+        rewrittenHeadHash = createCommitFromInfo(commitInfo, parentHash=rewrittenHeadHash)
+
+    if rewrittenHeadHash is None:
+        raise ContributionArtError("すべての履歴が除外対象になったため描画前の基点を作れません")
+
+    return rewrittenHeadHash
+
+
+def createCommitFromInfo(commitInfo: CommitInfo, *, parentHash: str | None) -> str:
+    """既存コミットのスナップショットとメタ情報を保ったまま新しい commit を作る"""
+
+    command = ["git", "commit-tree", commitInfo.treeHash]
+    if parentHash is not None:
+        command.extend(["-p", parentHash])
+    command.extend(["-F", "-"])
+
+    result = runCommand(
+        command,
+        captureOutput=True,
+        extraEnv={
+            "GIT_AUTHOR_NAME": commitInfo.authorName,
+            "GIT_AUTHOR_EMAIL": commitInfo.authorEmail,
+            "GIT_AUTHOR_DATE": commitInfo.authorDate.isoformat(),
+            "GIT_COMMITTER_NAME": commitInfo.committerName,
+            "GIT_COMMITTER_EMAIL": commitInfo.committerEmail,
+            "GIT_COMMITTER_DATE": commitInfo.committerDate.isoformat(),
+        },
+        inputText=commitInfo.message,
+    )
+
+    newCommitHash = result.stdout.strip()
+    if not newCommitHash:
+        raise ContributionArtError("履歴再構成中に commit hash を取得できませんでした")
+
+    return newCommitHash
 
 
 def buildTextGrid(text: str, fontName: str) -> tuple[str, ...]:
@@ -718,7 +850,7 @@ def requireCurrentBranchName() -> str:
     )
     branchName = result.stdout.strip()
     if not branchName:
-        raise ContributionArtError("detached HEAD では --reset-branch-history を使えません")
+        raise ContributionArtError("detached HEAD では --reset-drawing-range を使えません")
     return branchName
 
 
