@@ -58,6 +58,7 @@ uv run contributionArt.py "HELLO" `
 - `--time-start 18:30`
 - `--time-end 23:00`
 - `--font 7x7`
+- `--reset-branch-history`
 - `--timezone +09:00`
 - `--timezone Asia/Tokyo`
 - `--min-commits 2`
@@ -85,6 +86,8 @@ CONTRIBUTION_ART_MAX_COMMITS=6
 - コミットは現在のブランチに追加される
 - 誤って作業中の変更を含めないよう、`--apply` 時は作業ツリーがクリーンでないと停止する
 - 期間内に収まりきらない長さの文字列はエラーになる
+- `--reset-branch-history` は現在ブランチの履歴を現在ツリー 1 個のベースコミットへ作り直す
+- `--reset-branch-history --push` の組み合わせでは履歴書き換えになるため force push 相当で送信される
 
 ## 例
 
@@ -117,6 +120,7 @@ uv run contributionArt.py "KUWA" `
   --start-date 2021-01-03 `
   --end-date 2021-07-17 `
   --font 7x7 `
+  --reset-branch-history `
   --apply `
   --push
 ```

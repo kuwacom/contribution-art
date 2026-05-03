@@ -116,6 +116,7 @@ class CliConfig:
     seed: int
     apply: bool
     push: bool
+    resetBranchHistory: bool
     remote: str
     branch: str
     showDates: bool
@@ -160,6 +161,8 @@ def main() -> int:
             return 0
 
         ensureCleanWorkingTree()
+        if cliConfig.resetBranchHistory:
+            resetBranchHistory(cliConfig, graphPlan)
         createCommits(graphPlan, cliConfig)
 
         if cliConfig.push:
@@ -198,6 +201,11 @@ def parseArgs() -> CliConfig:
     parser.add_argument("--seed", type=int, default=None, help="同じ見た目を再現したいときの乱数シード")
     parser.add_argument("--apply", action="store_true", help="実際に空コミットを作る")
     parser.add_argument("--push", action="store_true", help="作成後に push する")
+    parser.add_argument(
+        "--reset-branch-history",
+        action="store_true",
+        help="現在ブランチの履歴を作り直してからコミットする",
+    )
     parser.add_argument("--remote", default=getEnvValue(envValues, "CONTRIBUTION_ART_REMOTE", "origin"))
     parser.add_argument("--branch", default=getEnvValue(envValues, "CONTRIBUTION_ART_BRANCH", detectCurrentBranch()))
     parser.add_argument("--show-dates", action="store_true", help="コミット日ごとの計画も表示する")
@@ -205,6 +213,9 @@ def parseArgs() -> CliConfig:
 
     if parsedArgs.push and not parsedArgs.apply:
         raise ContributionArtError("--push を使う場合は --apply も必要です")
+
+    if parsedArgs.reset_branch_history and not parsedArgs.apply:
+        raise ContributionArtError("--reset-branch-history を使う場合は --apply も必要です")
 
     startDate = parseDate(parsedArgs.start_date)
     endDate = parseDate(parsedArgs.end_date)
@@ -243,6 +254,7 @@ def parseArgs() -> CliConfig:
         seed=seed,
         apply=parsedArgs.apply,
         push=parsedArgs.push,
+        resetBranchHistory=parsedArgs.reset_branch_history,
         remote=parsedArgs.remote,
         branch=parsedArgs.branch,
         showDates=parsedArgs.show_dates,
@@ -312,6 +324,7 @@ def printPlan(graphPlan: GraphPlan, cliConfig: CliConfig) -> None:
     print(f"total commits: {graphPlan.totalCommits}")
     print(f"time window: {cliConfig.timeStart.strftime('%H:%M')} - {cliConfig.timeEnd.strftime('%H:%M')} {cliConfig.timezoneName}")
     print(f"seed: {cliConfig.seed}")
+    print(f"reset branch history: {'yes' if cliConfig.resetBranchHistory else 'no'}")
     print("")
 
     renderedRows = renderPreviewRows(graphPlan.gridRows)
@@ -455,10 +468,50 @@ def createCommits(graphPlan: GraphPlan, cliConfig: CliConfig) -> None:
             )
 
 
+def resetBranchHistory(cliConfig: CliConfig, graphPlan: GraphPlan) -> None:
+    """現在ブランチを現在ツリーの 1 コミットへ作り直してから描画を始める"""
+
+    currentBranchName = requireCurrentBranchName()
+    timestampSuffix = datetime.now().strftime("%Y%m%d%H%M%S")
+    backupBranchName = f"{currentBranchName}-backup-{timestampSuffix}"
+    temporaryBranchName = f"{currentBranchName}-reset-{timestampSuffix}"
+    timezoneInfo = buildTimezoneInfo(cliConfig.timezoneName)
+    baseCommitDate = datetime.combine(
+        graphPlan.requestedStartDate - timedelta(days=1),
+        time(hour=12, minute=0),
+        tzinfo=timezoneInfo,
+    ).isoformat()
+
+    runGitCommand(["git", "branch", backupBranchName, currentBranchName])
+    runGitCommand(["git", "switch", "--orphan", temporaryBranchName])
+    runGitCommand(["git", "add", "-A"])
+    runGitCommand(
+        [
+            "git",
+            "commit",
+            "--message",
+            f"chore: reset contribution art base ({backupBranchName})",
+            "--date",
+            baseCommitDate,
+        ],
+        extraEnv={
+            # ベースコミットを対象期間の外へ置いて描画範囲を汚さないようにする
+            "GIT_AUTHOR_DATE": baseCommitDate,
+            "GIT_COMMITTER_DATE": baseCommitDate,
+        },
+    )
+    runGitCommand(["git", "branch", "-M", currentBranchName])
+
+
 def pushCommits(cliConfig: CliConfig) -> None:
     """現在の HEAD を指定ブランチへ push する"""
 
-    runGitCommand(["git", "push", cliConfig.remote, f"HEAD:{cliConfig.branch}"])
+    pushCommand = ["git", "push"]
+    if cliConfig.resetBranchHistory:
+        # 履歴を作り直した場合は通常 push では拒否されるため明示的に強制する
+        pushCommand.append("--force-with-lease")
+    pushCommand.extend([cliConfig.remote, f"HEAD:{cliConfig.branch}"])
+    runGitCommand(pushCommand)
 
 
 def ensureCleanWorkingTree() -> None:
@@ -654,6 +707,19 @@ def detectCurrentBranch() -> str:
 
     branchName = result.stdout.strip()
     return branchName or "main"
+
+
+def requireCurrentBranchName() -> str:
+    """履歴を書き換える前に現在ブランチ名を厳密に取得する"""
+
+    result = runCommand(
+        ["git", "branch", "--show-current"],
+        captureOutput=True,
+    )
+    branchName = result.stdout.strip()
+    if not branchName:
+        raise ContributionArtError("detached HEAD では --reset-branch-history を使えません")
+    return branchName
 
 
 def loadEnvFile(envPath: Path) -> dict[str, str]:
